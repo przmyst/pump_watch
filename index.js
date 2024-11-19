@@ -16,34 +16,50 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const SOL_DECIMALS = 9;
 
 const connection = new Connection(RPC_ENDPOINT);
-const seenTransactions = new Set();
+const seenTransactions = new Set(); // Use a Set for efficient lookups
 
 subscribeToNewRaydiumPools();
 
 function subscribeToNewRaydiumPools() {
     connection.onLogs(new PublicKey(RAYDIUM_POOL_V4_PROGRAM_ID), async (txLogs) => {
-        if (seenTransactions.has(txLogs.signature)) {
-            return;
-        }
-        seenTransactions.add(txLogs.signature);
+        try {
+            if (!txLogs || !txLogs.signature || !txLogs.logs) {
+                console.error('Invalid transaction logs received');
+                return;
+            }
 
-        if (!findLogEntry('init_pc_amount', txLogs.logs)) {
-            return;
-        }
+            if (seenTransactions.has(txLogs.signature)) {
+                return;
+            }
+            seenTransactions.add(txLogs.signature);
 
-        const poolKeys = await fetchPoolKeysForLPInitTransactionHash(txLogs.signature);
-        if (!poolKeys) return;
-        if(poolKeys.quoteMint.toString().includes('pump') || poolKeys.baseMint.toString().includes('pump')) {
-            console.log(`https://dexscreener.com/solana/${poolKeys.id.toString()}`);
-            console.log('New pool detected:', poolKeys.id.toString());
-            console.log('Base Mint:', poolKeys.baseMint.toString());
-            console.log('Quote Mint:', poolKeys.quoteMint.toString());
-            console.log('LP Mint:', poolKeys.lpMint.toString());
+            if (!findLogEntry('init_pc_amount', txLogs.logs)) {
+                return;
+            }
+
+            const poolKeys = await fetchPoolKeysForLPInitTransactionHash(txLogs.signature);
+            if (!poolKeys) return;
+
+
+            if(poolKeys.quoteMint.toString().includes('pump') || poolKeys.baseMint.toString().includes('pump')) {
+                console.log(`https://dexscreener.com/solana/${poolKeys.id.toString()}`);
+                if(poolKeys.quoteMint.toString().includes('pump')) {
+                    console.log(`https://raydium.io/swap/?inputMint=${poolKeys.quoteMint.toString()}`)
+                }else{
+                    console.log(`https://raydium.io/swap/?inputMint=${poolKeys.baseMint.toString()}`)
+                }
+            }
+        } catch (error) {
+            console.error('Error processing logs:', error);
         }
     });
 }
 
 function findLogEntry(needle, logEntries) {
+    if (!Array.isArray(logEntries)) {
+        console.error('Invalid log entries');
+        return null;
+    }
     return logEntries.find(log => log.includes(needle)) || null;
 }
 
@@ -55,7 +71,15 @@ async function fetchPoolKeysForLPInitTransactionHash(txSignature) {
             return null;
         }
         const poolInfo = parsePoolInfoFromLpTransaction(tx);
+        if (!poolInfo) {
+            console.error('Failed to parse pool info from transaction');
+            return null;
+        }
         const marketInfo = await fetchMarketInfo(poolInfo.marketId);
+        if (!marketInfo) {
+            console.error('Failed to fetch market info');
+            return null;
+        }
 
         return {
             id: poolInfo.id,
@@ -94,105 +118,145 @@ async function fetchPoolKeysForLPInitTransactionHash(txSignature) {
 }
 
 async function fetchMarketInfo(marketId) {
-    const marketAccountInfo = await connection.getAccountInfo(marketId);
-    if (!marketAccountInfo) {
-        throw new Error('Failed to fetch market info for market ID ' + marketId.toBase58());
-    }
+    try {
+        const marketAccountInfo = await connection.getAccountInfo(marketId);
+        if (!marketAccountInfo) {
+            console.error('Failed to fetch market info for market ID ' + marketId.toBase58());
+            return null;
+        }
 
-    return MARKET_STATE_LAYOUT_V3.decode(marketAccountInfo.data);
+        return MARKET_STATE_LAYOUT_V3.decode(marketAccountInfo.data);
+    } catch (error) {
+        console.error('Error fetching market info:', error);
+        return null;
+    }
 }
 
 function parsePoolInfoFromLpTransaction(txData) {
-    const initInstruction = findInstructionByProgramId(
-        txData.transaction.message.instructions,
-        new PublicKey(RAYDIUM_POOL_V4_PROGRAM_ID)
-    );
-    if (!initInstruction) {
-        throw new Error('Failed to find LP init instruction in transaction');
+    try {
+        if (!txData || !txData.transaction || !txData.transaction.message) {
+            console.error('Invalid transaction data');
+            return null;
+        }
+
+        const initInstruction = findInstructionByProgramId(
+            txData.transaction.message.instructions,
+            new PublicKey(RAYDIUM_POOL_V4_PROGRAM_ID)
+        );
+        if (!initInstruction) {
+            console.error('Failed to find LP init instruction in transaction');
+            return null;
+        }
+
+        const baseMint = initInstruction.accounts[8];
+        const quoteMint = initInstruction.accounts[9];
+        const lpMint = initInstruction.accounts[7];
+        const baseVault = initInstruction.accounts[10];
+        const quoteVault = initInstruction.accounts[11];
+        const baseAndQuoteSwapped = baseMint.toBase58() === SOL_MINT;
+
+        const innerInstructions = txData.meta?.innerInstructions ?? [];
+
+        const lpMintInitInstruction = findInitializeMintInInnerInstructionsByMintAddress(
+            innerInstructions,
+            lpMint
+        );
+        if (!lpMintInitInstruction) {
+            console.error('Failed to find LP mint init instruction in transaction');
+            return null;
+        }
+
+        const lpMintInstruction = findMintToInInnerInstructionsByMintAddress(
+            innerInstructions,
+            lpMint
+        );
+        if (!lpMintInstruction) {
+            console.error('Failed to find LP mint-to instruction in transaction');
+            return null;
+        }
+
+        const baseTransferInstruction = findTransferInstructionInInnerInstructionsByDestination(
+            innerInstructions,
+            baseVault,
+            TOKEN_PROGRAM_ID
+        );
+        if (!baseTransferInstruction) {
+            console.error('Failed to find base transfer instruction in transaction');
+            return null;
+        }
+
+        const quoteTransferInstruction = findTransferInstructionInInnerInstructionsByDestination(
+            innerInstructions,
+            quoteVault,
+            TOKEN_PROGRAM_ID
+        );
+        if (!quoteTransferInstruction) {
+            console.error('Failed to find quote transfer instruction in transaction');
+            return null;
+        }
+
+        const lpDecimals = lpMintInitInstruction.parsed.info.decimals;
+        const logEntry = findLogEntry('init_pc_amount', txData.meta?.logMessages ?? []);
+        if (!logEntry) {
+            console.error('Failed to find init_pc_amount log entry');
+            return null;
+        }
+        const lpInitializationLogEntryInfo = extractLPInitializationLogEntryInfoFromLogEntry(logEntry);
+        if (!lpInitializationLogEntryInfo) {
+            console.error('Failed to extract LP initialization log entry info');
+            return null;
+        }
+        const basePreBalance = (txData.meta?.preTokenBalances ?? []).find(
+            balance => balance.mint === baseMint.toBase58()
+        );
+        if (!basePreBalance || !basePreBalance.uiTokenAmount) {
+            console.error('Failed to find base token pre-balance entry');
+            return null;
+        }
+        const baseDecimals = basePreBalance.uiTokenAmount.decimals;
+
+        return {
+            id: initInstruction.accounts[4],
+            baseMint,
+            quoteMint,
+            lpMint,
+            baseDecimals: baseAndQuoteSwapped ? SOL_DECIMALS : baseDecimals,
+            quoteDecimals: baseAndQuoteSwapped ? baseDecimals : SOL_DECIMALS,
+            lpDecimals,
+            programId: new PublicKey(RAYDIUM_POOL_V4_PROGRAM_ID),
+            authority: initInstruction.accounts[5],
+            openOrders: initInstruction.accounts[6],
+            targetOrders: initInstruction.accounts[13],
+            baseVault,
+            quoteVault,
+            withdrawQueue: new PublicKey("11111111111111111111111111111111"),
+            lpVault: new PublicKey(lpMintInstruction.parsed.info.account),
+            marketProgramId: initInstruction.accounts[15],
+            marketId: initInstruction.accounts[16],
+            baseReserve: parseInt(baseTransferInstruction.parsed.info.amount),
+            quoteReserve: parseInt(quoteTransferInstruction.parsed.info.amount),
+            lpReserve: parseInt(lpMintInstruction.parsed.info.amount),
+            openTime: lpInitializationLogEntryInfo.open_time,
+        };
+    } catch (error) {
+        console.error('Error parsing pool info from transaction:', error);
+        return null;
     }
-
-    const baseMint = initInstruction.accounts[8];
-    const quoteMint = initInstruction.accounts[9];
-    const lpMint = initInstruction.accounts[7];
-    const baseVault = initInstruction.accounts[10];
-    const quoteVault = initInstruction.accounts[11];
-    const baseAndQuoteSwapped = baseMint.toBase58() === SOL_MINT;
-
-    const lpMintInitInstruction = findInitializeMintInInnerInstructionsByMintAddress(
-        txData.meta?.innerInstructions ?? [],
-        lpMint
-    );
-    if (!lpMintInitInstruction) {
-        throw new Error('Failed to find LP mint init instruction in transaction');
-    }
-
-    const lpMintInstruction = findMintToInInnerInstructionsByMintAddress(
-        txData.meta?.innerInstructions ?? [],
-        lpMint
-    );
-    if (!lpMintInstruction) {
-        throw new Error('Failed to find LP mint-to instruction in transaction');
-    }
-
-    const baseTransferInstruction = findTransferInstructionInInnerInstructionsByDestination(
-        txData.meta?.innerInstructions ?? [],
-        baseVault,
-        TOKEN_PROGRAM_ID
-    );
-    if (!baseTransferInstruction) {
-        throw new Error('Failed to find base transfer instruction in transaction');
-    }
-
-    const quoteTransferInstruction = findTransferInstructionInInnerInstructionsByDestination(
-        txData.meta?.innerInstructions ?? [],
-        quoteVault,
-        TOKEN_PROGRAM_ID
-    );
-    if (!quoteTransferInstruction) {
-        throw new Error('Failed to find quote transfer instruction in transaction');
-    }
-
-    const lpDecimals = lpMintInitInstruction.parsed.info.decimals;
-    const logEntry = findLogEntry('init_pc_amount', txData.meta?.logMessages ?? []);
-    const lpInitializationLogEntryInfo = extractLPInitializationLogEntryInfoFromLogEntry(logEntry ?? '');
-    const basePreBalance = (txData.meta?.preTokenBalances ?? []).find(
-        balance => balance.mint === baseMint.toBase58()
-    );
-    if (!basePreBalance) {
-        throw new Error('Failed to find base token pre-balance entry');
-    }
-    const baseDecimals = basePreBalance.uiTokenAmount.decimals;
-
-    return {
-        id: initInstruction.accounts[4],
-        baseMint,
-        quoteMint,
-        lpMint,
-        baseDecimals: baseAndQuoteSwapped ? SOL_DECIMALS : baseDecimals,
-        quoteDecimals: baseAndQuoteSwapped ? baseDecimals : SOL_DECIMALS,
-        lpDecimals,
-        programId: new PublicKey(RAYDIUM_POOL_V4_PROGRAM_ID),
-        authority: initInstruction.accounts[5],
-        openOrders: initInstruction.accounts[6],
-        targetOrders: initInstruction.accounts[13],
-        baseVault,
-        quoteVault,
-        withdrawQueue: new PublicKey("11111111111111111111111111111111"),
-        lpVault: new PublicKey(lpMintInstruction.parsed.info.account),
-        marketProgramId: initInstruction.accounts[15],
-        marketId: initInstruction.accounts[16],
-        baseReserve: parseInt(baseTransferInstruction.parsed.info.amount),
-        quoteReserve: parseInt(quoteTransferInstruction.parsed.info.amount),
-        lpReserve: parseInt(lpMintInstruction.parsed.info.amount),
-        openTime: lpInitializationLogEntryInfo.open_time,
-    };
 }
 
 function findInstructionByProgramId(instructions, programId) {
+    if (!Array.isArray(instructions) || !programId) {
+        console.error('Invalid instructions or program ID');
+        return null;
+    }
     return instructions.find(instr => instr.programId.equals(programId)) || null;
 }
 
 function findInitializeMintInInnerInstructionsByMintAddress(innerInstructions, mintAddress) {
+    if (!Array.isArray(innerInstructions) || !mintAddress) {
+        console.error('Invalid inner instructions or mint address');
+        return null;
+    }
     for (const inner of innerInstructions) {
         for (const instruction of inner.instructions) {
             if (instruction.parsed?.type === 'initializeMint' &&
@@ -205,6 +269,10 @@ function findInitializeMintInInnerInstructionsByMintAddress(innerInstructions, m
 }
 
 function findMintToInInnerInstructionsByMintAddress(innerInstructions, mintAddress) {
+    if (!Array.isArray(innerInstructions) || !mintAddress) {
+        console.error('Invalid inner instructions or mint address');
+        return null;
+    }
     for (const inner of innerInstructions) {
         for (const instruction of inner.instructions) {
             if (instruction.parsed?.type === 'mintTo' &&
@@ -217,6 +285,10 @@ function findMintToInInnerInstructionsByMintAddress(innerInstructions, mintAddre
 }
 
 function findTransferInstructionInInnerInstructionsByDestination(innerInstructions, destinationAccount, programId) {
+    if (!Array.isArray(innerInstructions) || !destinationAccount) {
+        console.error('Invalid inner instructions or destination account');
+        return null;
+    }
     for (const inner of innerInstructions) {
         for (const instruction of inner.instructions) {
             if (instruction.parsed?.type === 'transfer' &&
@@ -230,14 +302,25 @@ function findTransferInstructionInInnerInstructionsByDestination(innerInstructio
 }
 
 function extractLPInitializationLogEntryInfoFromLogEntry(lpLogEntry) {
-    const lpInitializationLogEntryInfoStart = lpLogEntry.indexOf('{');
-    if (lpInitializationLogEntryInfoStart === -1) {
-        return {};
+    try {
+        const lpInitializationLogEntryInfoStart = lpLogEntry.indexOf('{');
+        if (lpInitializationLogEntryInfoStart === -1) {
+            console.error('Failed to find JSON in LP initialization log entry');
+            return null;
+        }
+        const jsonString = lpLogEntry.substring(lpInitializationLogEntryInfoStart);
+        const fixedJsonString = fixRelaxedJsonInLpLogEntry(jsonString);
+        return JSON.parse(fixedJsonString);
+    } catch (error) {
+        console.error('Error extracting LP initialization log entry info:', error);
+        return null;
     }
-    const jsonString = lpLogEntry.substring(lpInitializationLogEntryInfoStart);
-    return JSON.parse(fixRelaxedJsonInLpLogEntry(jsonString));
 }
 
 function fixRelaxedJsonInLpLogEntry(relaxedJson) {
+    if (typeof relaxedJson !== 'string') {
+        console.error('Invalid relaxed JSON string');
+        return '';
+    }
     return relaxedJson.replace(/([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":');
 }
