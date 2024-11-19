@@ -33,7 +33,7 @@ function subscribeToNewRaydiumPools() {
 
         const poolKeys = await fetchPoolKeysForLPInitTransactionHash(txLogs.signature);
         if (!poolKeys) return;
-        if(poolKeys.quoteMint.toString().includes('pump')) {
+        if(poolKeys.quoteMint.toString().includes('pump') || poolKeys.baseMint.toString().includes('pump')) {
             console.log(`https://dexscreener.com/solana/${poolKeys.id.toString()}`);
             console.log('New pool detected:', poolKeys.id.toString());
             console.log('Base Mint:', poolKeys.baseMint.toString());
